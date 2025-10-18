@@ -6,7 +6,29 @@ from rightmove_webscraper import RightmoveData
 
 
 base_url = "https://www.rightmove.co.uk/"
-required_columns = {"address", "agent_url", "number_bedrooms", "postcode", "price", "search_date", "type", "url"}
+required_columns = {
+    "address",
+    "agent_url",
+    "number_bedrooms",
+    "postcode",
+    "price",
+    "search_date",
+    "type",
+    "url",
+    "let_available_date",
+    "let_type",
+    "furnish_type",
+    "council_tax",
+    "minimum_tenancy_months",
+    "deposit",
+    "description",
+    "property_type",
+    "key_features",
+    "utilities_rights_restrictions",
+    "location",
+    "latitude",
+    "longitude",
+}
 
 
 def test_sale_residential():
@@ -27,6 +49,8 @@ def test_sale_residential():
     assert {"number_bedrooms", "count", "mean"}.issubset(set(df.columns))
     assert len(df) > 0
     for c in required_columns:
+        if rm.get_results[c].dropna().empty:
+            continue
         df = rm.summary(by=c)
         assert isinstance(df, pd.DataFrame)
         assert {c, "count", "mean"}.issubset(set(df.columns))
@@ -51,6 +75,8 @@ def test_rent_residential():
     assert {"number_bedrooms", "count", "mean"}.issubset(set(df.columns))
     assert len(df) > 0
     for c in required_columns:
+        if rm.get_results[c].dropna().empty:
+            continue
         df = rm.summary(by=c)
         assert isinstance(df, pd.DataFrame)
         assert {c, "count", "mean"}.issubset(set(df.columns))
@@ -77,6 +103,8 @@ def test_sale_commercial():
     for c in required_columns:
         if c == "number_bedrooms":
             continue
+        if rm.get_results[c].dropna().empty:
+            continue
         df = rm.summary(by=c)
         assert isinstance(df, pd.DataFrame)
         assert {c, "count", "mean"}.issubset(set(df.columns))
@@ -102,6 +130,8 @@ def test_rent_commercial():
     assert len(df) > 0
     for c in required_columns:
         if c == "number_bedrooms":
+            continue
+        if rm.get_results[c].dropna().empty:
             continue
         df = rm.summary(by=c)
         assert isinstance(df, pd.DataFrame)

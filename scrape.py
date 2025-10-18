@@ -33,13 +33,27 @@ available = results[
 ].copy()
 available.sort_values("let_available_date", inplace=True)
 
+if available.empty:
+    print(
+        f"\nNo properties available from {target_date_str} onwards with the current filters."
+    )
+else:
+    print("\nFetching detailed letting information for filtered properties...")
+    available = rm.enrich_property_details(available)
+
 output_filename = (
     f"rightmove_listings_{target_date.strftime('%Y%m%d')}.csv"
 )
 output_path = Path(output_filename)
-available.to_csv(output_path, index=False)
-
-print(
-    f"\nWrote {len(available)} properties available from {target_date_str} "
-    f"onwards to {output_path.resolve()}"
-)
+try:
+    available.to_csv(output_path, index=False)
+except PermissionError as exc:
+    print(
+        f"\nUnable to write results to {output_path.resolve()}: {exc}. "
+        "Please close the file if it is open and rerun the script."
+    )
+else:
+    print(
+        f"\nWrote {len(available)} properties available from {target_date_str} "
+        f"onwards to {output_path.resolve()}"
+    )

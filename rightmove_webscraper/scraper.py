@@ -1,5 +1,6 @@
 import datetime
 import json
+from typing import Any, Dict
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from lxml import html
@@ -10,6 +11,7 @@ import requests
 
 BASE_URL = "https://www.rightmove.co.uk"
 REQUEST_TIMEOUT = 20
+PROPERTY_DETAILS_TIMEOUT = 5
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -32,7 +34,12 @@ class RightmoveData:
     The query to rightmove can be renewed by calling the `refresh_data` method.
     """
 
-    def __init__(self, url: str, get_floorplans: bool = False):
+    def __init__(
+        self,
+        url: str,
+        get_floorplans: bool = False,
+        include_property_details: bool = False,
+    ):
         """Initialize the scraper with a URL from the results of a property
         search performed on www.rightmove.co.uk.
 
@@ -41,21 +48,32 @@ class RightmoveData:
             get_floorplans (bool): optionally scrape links to the individual
                 floor plan images for each listing (be warned this drastically
                 increases runtime so is False by default).
+            include_property_details (bool): when True, request each individual
+                property page to enrich the results with additional letting
+                details (increases runtime).
         """
+        self._session = requests.Session()
         self._status_code, self._first_page = self._request(url)
         self._url = url
         self._validate_url()
+        self._include_property_details = include_property_details
+        self._property_details_cache: Dict[str, Dict[str, Any]] = {}
         self._first_search_results = self._extract_search_results(self._first_page)
         self._results = self._get_results(get_floorplans=get_floorplans)
 
-    @staticmethod
-    def _request(url: str):
-        response = requests.get(
-            url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT
+    def _request(self, url: str, *, timeout: float | None = None):
+        request_timeout = timeout if timeout is not None else REQUEST_TIMEOUT
+        response = self._session.get(
+            url, headers=REQUEST_HEADERS, timeout=request_timeout
         )
         return response.status_code, response.content
 
-    def refresh_data(self, url: str = None, get_floorplans: bool = False):
+    def refresh_data(
+        self,
+        url: str = None,
+        get_floorplans: bool = False,
+        include_property_details: bool | None = None,
+    ):
         """Make a fresh GET request for the rightmove data.
 
         Args:
@@ -64,11 +82,16 @@ class RightmoveData:
             get_floorplans (bool): optionally scrape links to the individual
                 flooplan images for each listing (this drastically increases
                 runtime so is False by default).
+            include_property_details (bool | None): optionally override the
+                existing behaviour for fetching individual property pages.
         """
+        if include_property_details is not None:
+            self._include_property_details = include_property_details
         url = self.url if not url else url
         self._status_code, self._first_page = self._request(url)
         self._url = url
         self._validate_url()
+        self._property_details_cache = {}
         self._first_search_results = self._extract_search_results(self._first_page)
         self._results = self._get_results(get_floorplans=get_floorplans)
 
@@ -205,18 +228,207 @@ class RightmoveData:
             )
         )
 
+    @staticmethod
+    def _extract_json_blob(script_text: str) -> str | None:
+        if not script_text:
+            return None
+        start = script_text.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(script_text)):
+            char = script_text[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+            else:
+                if char == '"':
+                    in_string = True
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return script_text[start : idx + 1]
+        return None
+
+    @staticmethod
+    def _clean_description(raw_description: str | None):
+        if not raw_description:
+            return np.nan
+        try:
+            fragment = html.fromstring(f"<div>{raw_description}</div>")
+            text = fragment.text_content()
+        except (ValueError, TypeError):
+            return raw_description
+        cleaned = " ".join(text.split())
+        return cleaned if cleaned else np.nan
+
+    @staticmethod
+    def _format_key_features(features: list | None):
+        if not features:
+            return np.nan
+        filtered = [f for f in features if f]
+        if not filtered:
+            return np.nan
+        return "; ".join(filtered)
+
+    @staticmethod
+    def _format_council_tax(living_costs: Dict[str, Any] | None):
+        if not living_costs:
+            return np.nan
+        band = living_costs.get("councilTaxBand")
+        included = living_costs.get("councilTaxIncluded")
+        exempt = living_costs.get("councilTaxExempt")
+        if not band:
+            return np.nan
+        parts = [f"Band {band}"]
+        if included is True:
+            parts.append("included in rent")
+        elif included is False:
+            parts.append("not included")
+        if exempt:
+            parts.append("exempt")
+        return " - ".join(parts)
+
+    @staticmethod
+    def _format_utilities(features: Dict[str, Any] | None):
+        if not isinstance(features, dict):
+            return np.nan
+        prepared: Dict[str, Any] = {}
+        for key, value in features.items():
+            if isinstance(value, list):
+                items = []
+                for entry in value:
+                    if isinstance(entry, dict):
+                        text = entry.get("displayText") or entry.get("alias")
+                        if text:
+                            items.append(text)
+                    elif entry:
+                        items.append(str(entry))
+                if items:
+                    prepared[key] = items
+            elif isinstance(value, dict):
+                nested = {k: v for k, v in value.items() if v not in (None, "", [])}
+                if nested:
+                    prepared[key] = nested
+            elif value not in (None, "", []):
+                prepared[key] = value
+        if not prepared:
+            return np.nan
+        return json.dumps(prepared, ensure_ascii=False)
+
+    @staticmethod
+    def _normalise_detail_columns(results: pd.DataFrame):
+        if "minimum_tenancy_months" in results.columns:
+            results["minimum_tenancy_months"] = pd.to_numeric(
+                results["minimum_tenancy_months"], errors="coerce"
+            )
+
+        if "deposit" in results.columns:
+            cleaned = results["deposit"].astype(str)
+            cleaned = cleaned.str.replace(r"[^\d.]", "", regex=True)
+            cleaned = cleaned.where(cleaned != "", np.nan)
+            results["deposit"] = pd.to_numeric(cleaned, errors="coerce")
+
+        if "latitude" in results.columns:
+            results["latitude"] = pd.to_numeric(results["latitude"], errors="coerce")
+        if "longitude" in results.columns:
+            results["longitude"] = pd.to_numeric(results["longitude"], errors="coerce")
+
+    def _fetch_property_details(self, property_url: str | None, include_floorplans: bool):
+        if not property_url:
+            return {}
+        cached = self._property_details_cache.get(property_url)
+        if cached is None:
+            cached = self._extract_property_details(property_url)
+            self._property_details_cache[property_url] = cached
+        details = cached.copy()
+        if not include_floorplans:
+            details.pop("floorplan_url", None)
+        return details
+
+    def _extract_property_details(self, property_url: str) -> Dict[str, Any]:
+        details: Dict[str, Any] = {}
+        try:
+            status_code, content = self._request(
+                property_url, timeout=PROPERTY_DETAILS_TIMEOUT
+            )
+        except requests.RequestException:
+            return details
+        if status_code != 200:
+            return details
+        try:
+            tree = html.fromstring(content)
+        except (TypeError, ValueError):
+            return details
+        scripts = tree.xpath("//script[contains(text(),'window.PAGE_MODEL')]/text()")
+        if not scripts:
+            return details
+        json_text = self._extract_json_blob(scripts[0])
+        if not json_text:
+            return details
+        try:
+            payload = json.loads(json_text)
+        except json.JSONDecodeError:
+            return details
+        property_data = payload.get("propertyData") or {}
+        lettings = property_data.get("lettings") or {}
+        living_costs = property_data.get("livingCosts") or {}
+        location = property_data.get("location") or {}
+        features = property_data.get("features") or {}
+        key_features = property_data.get("keyFeatures") or []
+        floorplans = property_data.get("floorplans") or []
+        description = property_data.get("text", {}).get("description")
+
+        floorplan_url = np.nan
+        if floorplans:
+            first_floorplan = floorplans[0]
+            if isinstance(first_floorplan, dict):
+                fp_url = first_floorplan.get("url")
+                if fp_url:
+                    floorplan_url = urljoin(BASE_URL, fp_url)
+
+        def optional(value: Any):
+            if value in (None, ""):
+                return np.nan
+            return value
+
+        details.update(
+            {
+                "let_type": optional(lettings.get("letType")),
+                "furnish_type": optional(lettings.get("furnishType")),
+                "council_tax": self._format_council_tax(living_costs),
+                "minimum_tenancy_months": optional(
+                    lettings.get("minimumTermInMonths")
+                ),
+                "deposit": optional(lettings.get("deposit")),
+                "description": self._clean_description(description),
+                "property_type": optional(
+                    property_data.get("propertySubType")
+                    or property_data.get("propertyType")
+                ),
+                "key_features": self._format_key_features(key_features),
+                "utilities_rights_restrictions": self._format_utilities(features),
+                "location": json.dumps(location, ensure_ascii=False)
+                if location
+                else np.nan,
+                "latitude": optional(location.get("latitude")),
+                "longitude": optional(location.get("longitude")),
+                "floorplan_url": floorplan_url,
+            }
+        )
+        return details
+
     def _results_from_search(self, search_results, get_floorplans: bool = False):
         properties = search_results.get("properties") or []
-        columns = [
-            "price",
-            "type",
-            "address",
-            "url",
-            "agent_url",
-            "number_bedrooms",
-            "let_available_date",
-        ]
-        rows = []
+        rows: list[Dict[str, Any]] = []
         for prop in properties:
             price_data = prop.get("price") or {}
             price = price_data.get("amount")
@@ -231,40 +443,49 @@ class RightmoveData:
             agent_url = prop.get("contactUrl")
             bedrooms = prop.get("bedrooms")
             let_available_date = prop.get("letAvailableDate")
-            rows.append(
-                [
-                    price if price is not None else np.nan,
-                    property_type,
-                    address,
-                    urljoin(BASE_URL, property_url) if property_url else np.nan,
-                    urljoin(BASE_URL, agent_url) if agent_url else np.nan,
-                    bedrooms if bedrooms is not None else np.nan,
-                    let_available_date,
-                ]
+            full_property_url = (
+                urljoin(BASE_URL, property_url) if property_url else None
             )
-        df = pd.DataFrame(rows, columns=columns)
+            row: Dict[str, Any] = {
+                "price": price if price is not None else np.nan,
+                "type": property_type,
+                "address": address,
+                "url": full_property_url if full_property_url else np.nan,
+                "agent_url": urljoin(BASE_URL, agent_url)
+                if agent_url
+                else np.nan,
+                "number_bedrooms": bedrooms if bedrooms is not None else np.nan,
+                "let_available_date": let_available_date,
+            }
+            detail_defaults = {
+                "let_type": np.nan,
+                "furnish_type": np.nan,
+                "council_tax": np.nan,
+                "minimum_tenancy_months": np.nan,
+                "deposit": np.nan,
+                "description": np.nan,
+                "property_type": np.nan,
+                "key_features": np.nan,
+                "utilities_rights_restrictions": np.nan,
+                "location": np.nan,
+                "latitude": np.nan,
+                "longitude": np.nan,
+                "floorplan_url": np.nan,
+            }
+            row.update(detail_defaults)
+            should_fetch_details = (
+                (self._include_property_details and "rent" in self.rent_or_sale)
+                or get_floorplans
+            )
+            if should_fetch_details and full_property_url:
+                details = self._fetch_property_details(
+                    full_property_url, include_floorplans=get_floorplans
+                )
+                row.update(details)
+            rows.append(row)
+        df = pd.DataFrame(rows)
         df = df[df["address"].notnull()]
-        if get_floorplans and not df.empty:
-            df["floorplan_url"] = df["url"].apply(self._fetch_floorplan_url)
         return df
-
-    def _fetch_floorplan_url(self, property_url):
-        if not isinstance(property_url, str) or not property_url:
-            return np.nan
-        status_code, content = self._request(property_url)
-        if status_code != 200:
-            return np.nan
-        tree = html.fromstring(content)
-        xp_floorplan = "//img[contains(@src, 'floorplan')]/@src"
-        floorplan_urls = tree.xpath(xp_floorplan)
-        if not floorplan_urls:
-            return np.nan
-        floorplan_url = floorplan_urls[0]
-        if floorplan_url.startswith("//"):
-            floorplan_url = f"https:{floorplan_url}"
-        elif floorplan_url.startswith("/"):
-            floorplan_url = urljoin(BASE_URL, floorplan_url)
-        return floorplan_url
 
     def _get_results(self, get_floorplans: bool = False):
         frames = [
@@ -288,6 +509,65 @@ class RightmoveData:
         else:
             results = pd.concat(frames, ignore_index=True)
         return self._clean_results(results)
+
+    def enrich_property_details(
+        self, df: pd.DataFrame, include_floorplans: bool = False
+    ) -> pd.DataFrame:
+        """Fetch property details for the provided DataFrame rows.
+
+        Args:
+            df (pd.DataFrame): subset of rows to enrich. Must include a `url`
+                column containing full property URLs.
+            include_floorplans (bool): when True, attempt to extract floorplan
+                URLs while fetching property details (slower).
+
+        Returns:
+            pd.DataFrame: copy of the input DataFrame with additional columns
+            populated where available.
+        """
+
+        if df.empty or "url" not in df.columns:
+            return df.copy()
+
+        detail_columns = [
+            "let_type",
+            "furnish_type",
+            "council_tax",
+            "minimum_tenancy_months",
+            "deposit",
+            "description",
+            "property_type",
+            "key_features",
+            "utilities_rights_restrictions",
+            "location",
+            "latitude",
+            "longitude",
+            "floorplan_url",
+        ]
+
+        result = df.copy()
+        for column in detail_columns:
+            if column not in result.columns:
+                result[column] = np.nan
+            result[column] = result[column].astype(object)
+
+        urls = [
+            url
+            for url in result["url"].dropna().unique()
+            if isinstance(url, str) and url
+        ]
+
+        for url in urls:
+            details = self._fetch_property_details(url, include_floorplans)
+            if not details:
+                continue
+            mask = result["url"] == url
+            for key, value in details.items():
+                if key in detail_columns:
+                    result.loc[mask, key] = value
+
+        RightmoveData._normalise_detail_columns(result)
+        return result
 
     @staticmethod
     def _clean_results(results: pd.DataFrame):
@@ -315,6 +595,8 @@ class RightmoveData:
             results["let_available_date"] = results["let_available_date"].dt.tz_convert(
                 None
             )
+
+        RightmoveData._normalise_detail_columns(results)
 
         studio_mask = results["type"].str.contains(
             "studio", case=False, na=False
